@@ -12,7 +12,7 @@ st.set_page_config(
     layout="wide"
 )
 
-from src.models.entities import Course, ExamModel, ExamAttempt, Document, TopicPerformance
+from src.models.entities import Course, ExamModel, ExamAttempt, Document, TopicPerformance, Answer, QuestionModel
 from src.services.ingestion import DocumentIngestor
 from src.services.generator import QuestionGenerator
 from src.services.exam_engine import ExamEngine
@@ -253,32 +253,48 @@ def show_results():
         return
 
     device_session_id = get_device_session_id()
+    scope = st.radio(
+        "Results scope",
+        options=["All sessions", "This device"],
+        horizontal=True,
+        key="results_scope",
+    )
+
     with get_db_session() as session:
-        attempts = (
-            session.query(ExamAttempt)
-            .filter(ExamAttempt.student_identifier == device_session_id)
-            .order_by(ExamAttempt.created_at.desc())
-            .all()
+        attempts_query = (
+            session.query(ExamAttempt, Course.code, ExamModel.title)
+            .join(Course, ExamAttempt.course_id == Course.id)
+            .join(ExamModel, ExamAttempt.exam_id == ExamModel.id)
         )
+
+        if scope == "This device":
+            attempts_query = attempts_query.filter(ExamAttempt.student_identifier == device_session_id)
+
+        attempt_records = attempts_query.order_by(ExamAttempt.created_at.desc()).all()
+
         attempt_rows = [{
             "Attempt ID": a.attempt_id,
-            "Course": a.course_id,
-            "Score": a.score,
-            "Total": a.total_marks,
-            "Percentage": a.percentage,
-            "Status": "Passed" if a.is_passed else "Failed",
+            "Course": course_code,
+            "Exam": exam_title,
+            "Score": a.score if a.status == "completed" else "-",
+            "Total": a.total_marks if a.status == "completed" else "-",
+            "Percentage": f"{a.percentage:.2f}%" if a.status == "completed" else "-",
+            "Status": ("Passed" if a.is_passed else "Failed") if a.status == "completed" else a.status.replace("_", " ").title(),
             "Date": a.created_at.strftime("%Y-%m-%d %H:%M")
-        } for a in attempts]
-        attempt_options = [a.attempt_id for a in attempts]
+        } for a, course_code, exam_title in attempt_records]
+        attempt_options = [a.attempt_id for a, _, _ in attempt_records]
 
-    if not attempts:
-        st.info("No exam attempts found yet for this device session.")
+    if not attempt_records:
+        if scope == "This device":
+            st.info("No exam attempts found yet for this device session.")
+        else:
+            st.info("No exam attempts found yet.")
         return
 
     # Table of attempts
     df = pd.DataFrame(attempt_rows)
 
-    st.table(df)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
     # Detail view
     selected_att = st.selectbox("View detailed analysis for Attempt ID", options=attempt_options, key="results_attempt_select")
@@ -287,6 +303,32 @@ def show_results():
             attempt = session.query(ExamAttempt).filter(ExamAttempt.attempt_id == selected_att).first()
             if attempt:
                 perf = session.query(TopicPerformance).filter(TopicPerformance.attempt_id == attempt.id).all()
+                answers = session.query(Answer).filter(Answer.attempt_id == attempt.id).all()
+                answer_map = {answer.question_uid: answer for answer in answers}
+                questions = (
+                    session.query(QuestionModel)
+                    .filter(QuestionModel.exam_id == attempt.exam_id)
+                    .order_by(QuestionModel.order_index)
+                    .all()
+                )
+                review_questions = []
+                for question in questions:
+                    answer = answer_map.get(question.question_uid)
+                    selected = answer.selected_option if answer else None
+                    review_questions.append({
+                        "uid": question.question_uid,
+                        "text": question.question_text,
+                        "options": {
+                            "A": question.option_a,
+                            "B": question.option_b,
+                            "C": question.option_c,
+                            "D": question.option_d,
+                        },
+                        "selected_answer": selected,
+                        "correct_answer": question.correct_answer,
+                        "is_correct": selected == question.correct_answer,
+                        "explanation": question.explanation,
+                    })
 
                 if perf:
                     perf_df = pd.DataFrame([{
@@ -302,6 +344,15 @@ def show_results():
                     st.plotly_chart(fig)
                 else:
                     st.warning("No topic analysis available for this attempt.")
+
+                if review_questions:
+                    show_exam_review({
+                        "score": attempt.score,
+                        "total": attempt.total_marks,
+                        "percentage": attempt.percentage,
+                        "is_passed": attempt.is_passed,
+                        "questions": review_questions,
+                    })
 
 def show_exam_review(results):
     import html
@@ -353,6 +404,10 @@ def show_take_exam():
             st.rerun()
         return
 
+    if "active_attempt" in st.session_state:
+        show_active_exam()
+        return
+
     with get_db_session() as session:
         courses = session.query(Course).all()
         course_list = {c.code: c.title for c in courses}
@@ -389,38 +444,38 @@ def show_take_exam():
     else:
         st.info("No courses available. Please create a course first in Course Management.")
 
-    if "active_attempt" in st.session_state:
-        attempt = st.session_state.active_attempt
-        st.markdown(f"### {attempt['exam_title']}")
-        st.info(f"Time Limit: {attempt['duration']} minutes")
+def show_active_exam():
+    attempt = st.session_state.active_attempt
+    st.markdown(f"### {attempt['exam_title']}")
+    st.info(f"Time Limit: {attempt['duration']} minutes")
 
-        user_answers = {}
+    user_answers = {}
 
-        for i, q in enumerate(attempt['questions']):
-            st.markdown(f"**Question {i+1}:** {q['text']}")
-            # Use a unique key for each radio button
-            user_answers[q['uid']] = st.radio(
-                f"Select answer for {q['uid']}",
-                options=["A", "B", "C", "D"],
-                format_func=lambda x: f"{x}: {q['options'][x]}",
-                index=None,
-                key=f"q_{q['uid']}"
-            )
-            st.markdown("---")
+    for i, q in enumerate(attempt['questions']):
+        st.markdown(f"**Question {i+1}:** {q['text']}")
+        # Use a unique key for each radio button
+        user_answers[q['uid']] = st.radio(
+            f"Select answer for {q['uid']}",
+            options=["A", "B", "C", "D"],
+            format_func=lambda x: f"{x}: {q['options'][x]}",
+            index=None,
+            key=f"q_{q['uid']}"
+        )
+        st.markdown("---")
 
-        if st.button("✅ Submit Exam"):
-            with st.spinner("Calculating score..."):
-                engine = get_exam_engine()
-                results = engine.submit_exam(attempt['attempt_id'], user_answers)
-                if not results:
-                    st.error("Could not submit exam. Please try again.")
-                    return
+    if st.button("✅ Submit Exam"):
+        with st.spinner("Calculating score..."):
+            engine = get_exam_engine()
+            results = engine.submit_exam(attempt['attempt_id'], user_answers)
+            if not results:
+                st.error("Could not submit exam. Please try again.")
+                return
 
-                st.session_state.last_results = results
+            st.session_state.last_results = results
 
-                # Clear attempt from state
-                del st.session_state.active_attempt
-                st.rerun()
+            # Clear attempt from state
+            del st.session_state.active_attempt
+            st.rerun()
 
 
 if __name__ == "__main__":
