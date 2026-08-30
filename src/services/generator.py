@@ -109,7 +109,7 @@ class QuestionGenerator:
 
         raise ValueError("LLM response did not contain question objects")
 
-    def _question_response_schema(self) -> Dict[str, Any]:
+    def _question_response_schema(self, count: int) -> Dict[str, Any]:
         question_schema = {
             "type": "object",
             "properties": {
@@ -141,6 +141,8 @@ class QuestionGenerator:
             "properties": {
                 "questions": {
                     "type": "array",
+                    "minItems": count,
+                    "maxItems": count,
                     "items": question_schema,
                 }
             },
@@ -153,6 +155,7 @@ class QuestionGenerator:
         Generates an exam by retrieving context and prompting the LLM.
         """
         self.last_error = None
+        count = int(count)
         context = self._retrieve_context(course_code, topic)
         if not context:
             logger.warning("No context retrieved for question generation.")
@@ -168,6 +171,7 @@ class QuestionGenerator:
         Difficulty: {difficulty}
 
         Requirements:
+        0. Generate exactly {count} questions. Do not generate fewer or more than {count}.
         1. Each question must have exactly 4 options (A, B, C, D).
         2. Only one option must be correct.
         3. Provide a detailed explanation for the correct answer.
@@ -198,34 +202,49 @@ class QuestionGenerator:
         """
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You create university CBT multiple-choice exams and return only schema-valid JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "cbt_exam_questions",
-                        "strict": True,
-                        "schema": self._question_response_schema(),
-                    },
-                },
-            )
+            validated_questions = []
+            for attempt_number in range(1, 4):
+                retry_note = ""
+                if attempt_number > 1:
+                    retry_note = f"\nThe previous response did not contain exactly {count} valid questions. Try again with exactly {count} questions."
 
-            content = response.choices[0].message.content
-            questions_data = self._parse_questions_json(content)
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"You create university CBT multiple-choice exams and return exactly {count} schema-valid questions.",
+                        },
+                        {"role": "user", "content": prompt + retry_note},
+                    ],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "cbt_exam_questions",
+                            "strict": True,
+                            "schema": self._question_response_schema(count),
+                        },
+                    },
+                    max_completion_tokens=max(2048, min(12000, count * 600)),
+                )
 
-            if not questions_data:
-                self.last_error = "The model returned no questions."
-                logger.error(self.last_error)
+                content = response.choices[0].message.content
+                questions_data = self._parse_questions_json(content)
+
+                if not questions_data:
+                    self.last_error = "The model returned no questions."
+                    logger.error(self.last_error)
+                    continue
+
+                validated_questions = [MCQ.model_validate(q).model_dump() for q in questions_data]
+                if len(validated_questions) == count:
+                    break
+
+                self.last_error = f"The model returned {len(validated_questions)} questions, but {count} were requested."
+                logger.warning(self.last_error)
+
+            if len(validated_questions) != count:
                 return None
-
-            validated_questions = [MCQ.model_validate(q).model_dump() for q in questions_data]
 
             with get_db_session() as session:
                 course = session.query(Course).filter(Course.code == course_code).first()
@@ -240,13 +259,14 @@ class QuestionGenerator:
                     course_id=course.id,
                     title=title,
                     duration_minutes=settings.DEFAULT_EXAM_DURATION_MINUTES,
+                    total_marks=count,
                     difficulty=difficulty,
                     question_type="Multiple Choice"
                 )
                 session.add(exam)
                 session.flush()
 
-                for i, q_data in enumerate(validated_questions[:count]):
+                for i, q_data in enumerate(validated_questions):
                     question = QuestionModel(
                         exam_id=exam.id,
                         question_uid=f"Q_{uuid.uuid4().hex[:8].upper()}",
@@ -264,7 +284,7 @@ class QuestionGenerator:
                     )
                     session.add(question)
 
-                logger.info(f"Generated exam {exam_id_str} with {len(validated_questions[:count])} questions.")
+                logger.info(f"Generated exam {exam_id_str} with {len(validated_questions)} questions.")
                 return exam_id_str
 
         except Exception as e:

@@ -212,7 +212,7 @@ def show_course_mgmt():
                         title=exam_title,
                         topic=topic if topic else None,
                         difficulty=difficulty,
-                        count=count
+                        count=int(count)
                     )
                     if exam_id:
                         st.success(f"Exam {exam_id} generated successfully!")
