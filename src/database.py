@@ -1,41 +1,63 @@
 import logging
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Optional
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker, Session
 from src.config import settings
 from src.models.entities import Base
 
 logger = logging.getLogger(__name__)
 
-# Determine engine parameters based on database type (SQLite vs PostgreSQL)
-is_sqlite = settings.DATABASE_URL.startswith("sqlite")
-
-connect_args = {"check_same_thread": False} if is_sqlite else {"connect_timeout": 5}
-
-engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args=connect_args,
-    pool_pre_ping=True,
-    pool_recycle=300,
-    echo=settings.DEBUG,
-)
+_engine: Optional[Engine] = None
+_session_factory = None
+_sqlite_pragma_attached = False
 
 
-@event.listens_for(engine, "connect")
-def _set_sqlite_pragma(dbapi_connection, connection_record):
-    """Enable foreign key enforcement for SQLite."""
-    if is_sqlite:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+def _is_sqlite() -> bool:
+    return settings.DATABASE_URL.startswith("sqlite")
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def get_engine() -> Engine:
+    """Create the SQLAlchemy engine lazily so config errors can render in Streamlit."""
+    global _engine, _session_factory, _sqlite_pragma_attached
+    if _engine is not None:
+        return _engine
+
+    is_sqlite = _is_sqlite()
+    connect_args = {"check_same_thread": False} if is_sqlite else {"connect_timeout": 5}
+    _engine = create_engine(
+        settings.DATABASE_URL,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        echo=settings.DEBUG,
+    )
+    _session_factory = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+
+    if is_sqlite and not _sqlite_pragma_attached:
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragma(dbapi_connection, connection_record):
+            """Enable foreign key enforcement for SQLite."""
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+        _sqlite_pragma_attached = True
+
+    return _engine
+
+
+def get_session_factory():
+    global _session_factory
+    if _session_factory is None:
+        get_engine()
+    return _session_factory
 
 
 def init_db() -> None:
     """Initialize database tables for SQLite or PostgreSQL."""
     try:
+        engine = get_engine()
         Base.metadata.create_all(bind=engine)
         _ensure_schema_columns()
         logger.info(f"Database initialized successfully using: {settings.DATABASE_URL.split('@')[-1]}")
@@ -46,6 +68,7 @@ def init_db() -> None:
 
 def _ensure_schema_columns() -> None:
     """Add missing columns for databases created before the current models."""
+    engine = get_engine()
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
     column_specs = {
@@ -80,7 +103,7 @@ def _ensure_schema_columns() -> None:
 def test_connection() -> bool:
     """Verify database connection health."""
     try:
-        with engine.connect() as conn:
+        with get_engine().connect() as conn:
             conn.execute(text("SELECT 1"))
         return True
     except Exception as e:
@@ -91,7 +114,7 @@ def test_connection() -> bool:
 @contextmanager
 def get_db_session() -> Generator[Session, None, None]:
     """Context manager for handling database sessions safely."""
-    session: Session = SessionLocal()
+    session: Session = get_session_factory()()
     try:
         yield session
         session.commit()

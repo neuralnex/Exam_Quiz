@@ -66,6 +66,17 @@ class Settings(BaseSettings):
                 return True
         return value
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value):
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip().strip("'\"")
+        if normalized.startswith("postgres://"):
+            return normalized.replace("postgres://", "postgresql://", 1)
+        return normalized
+
 
 # Instantiate global settings
 settings = Settings()
