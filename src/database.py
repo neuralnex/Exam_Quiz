@@ -33,7 +33,12 @@ def get_engine() -> Engine:
         pool_recycle=300,
         echo=settings.DEBUG,
     )
-    _session_factory = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+    _session_factory = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=_engine,
+        expire_on_commit=False,
+    )
 
     if is_sqlite and not _sqlite_pragma_attached:
         @event.listens_for(_engine, "connect")

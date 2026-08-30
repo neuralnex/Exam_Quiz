@@ -260,26 +260,27 @@ def show_results():
             .order_by(ExamAttempt.created_at.desc())
             .all()
         )
+        attempt_rows = [{
+            "Attempt ID": a.attempt_id,
+            "Course": a.course_id,
+            "Score": a.score,
+            "Total": a.total_marks,
+            "Percentage": a.percentage,
+            "Status": "Passed" if a.is_passed else "Failed",
+            "Date": a.created_at.strftime("%Y-%m-%d %H:%M")
+        } for a in attempts]
+        attempt_options = [a.attempt_id for a in attempts]
 
     if not attempts:
         st.info("No exam attempts found yet for this device session.")
         return
 
     # Table of attempts
-    df = pd.DataFrame([{
-        "Attempt ID": a.attempt_id,
-        "Course": a.course_id, # In real app, join with Course
-        "Score": a.score,
-        "Total": a.total_marks,
-        "Percentage": a.percentage,
-        "Status": "Passed" if a.is_passed else "Failed",
-        "Date": a.created_at.strftime("%Y-%m-%d %H:%M")
-    } for a in attempts])
+    df = pd.DataFrame(attempt_rows)
 
     st.table(df)
 
     # Detail view
-    attempt_options = [a.attempt_id for a in attempts]
     selected_att = st.selectbox("View detailed analysis for Attempt ID", options=attempt_options, key="results_attempt_select")
     if selected_att:
         with get_db_session() as session:
